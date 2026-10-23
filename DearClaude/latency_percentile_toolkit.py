@@ -80,6 +80,100 @@ def decomposition_estimate(hop_percentiles, dominant, p_index):
     return others + hop_percentiles[dominant][p_index]
 
 
+class SyntheticStressTest:
+    """Validates the estimators above against known ground truth.
+
+    Generates per-hop latency from a lognormal 'fast path' + rare
+    lognormal 'slow path' mixture (simulates retries/cache-misses/GC
+    pauses) -- deliberately NOT pure lognormal, to check whether
+    fit_lognormal/fenton_wilkinson/decomposition_estimate hold up when
+    the real data doesn't match the modeling assumption exactly.
+
+    hop_specs: dict name -> (w_slow, (mu_fast, sigma_fast), (mu_slow, sigma_slow))
+    """
+
+    def __init__(self, hop_specs, n=8_000_000, seed=1):
+        self.hop_specs = hop_specs
+        self.n = n
+        rng = np.random.default_rng(seed)
+        self.true_samples, self.measured_pct = {}, {}
+        for name, (w, fast, slow) in hop_specs.items():
+            is_slow = rng.random(n) < w
+            x = np.where(is_slow, rng.lognormal(*slow, n), rng.lognormal(*fast, n))
+            self.true_samples[name] = x
+            self.measured_pct[name] = tuple(np.quantile(x, LEVELS))
+        self._total = sum(self.true_samples.values())
+
+    def ground_truth(self, p):
+        return np.quantile(self._total, p)
+
+    def single_big_jump(self, p):
+        """Which hop is the 'single big jump' behind true tail events at
+        percentile p? Returns dict name -> fraction of tail events it
+        dominates. See toolkit's dominant_hop() for the cheap proxy
+        (largest fitted sigma) that doesn't need this ground truth."""
+        threshold = self.ground_truth(p)
+        tail_mask = self._total > threshold
+        names = list(self.hop_specs)
+        typical = np.array([self.true_samples[n][~tail_mask].mean() for n in names])
+        stacked = np.vstack([self.true_samples[n][tail_mask] for n in names])
+        excess = stacked - typical[:, None]
+        dominant_idx = np.argmax(excess, axis=0)
+        return {n: float(np.mean(dominant_idx == i)) for i, n in enumerate(names)}
+
+    def tail_probability_matching(self, hop_fits, p):
+        """Asymptotic single-big-jump estimator: solve sum_i P(X_i>t) = 1-p
+        using each hop's fitted lognormal tail. Included for completeness --
+        in practice this underperformed decomposition_estimate at p99
+        because lognormal tails converge to the asymptotic regime slowly."""
+        def total_exceed_prob(t):
+            return sum(stats.lognorm.sf(t, s=s, scale=np.exp(mu)) for mu, s in hop_fits.values())
+        return optimize.brentq(lambda t: total_exceed_prob(t) - (1 - p), 1.0, 1e6)
+
+    def compare_estimators(self, p=0.99):
+        p_index = LEVELS.index(p)
+        truth = self.ground_truth(p)
+        naive = naive_sum(self.measured_pct, p_index)
+
+        hop_fits = {n: fit_lognormal(pct)[:2] for n, pct in self.measured_pct.items()}
+        mu_S, sigma_S = fenton_wilkinson(hop_fits)
+        fw = lognormal_quantile(mu_S, sigma_S, p)
+
+        dom = dominant_hop(hop_fits)
+        decomp = decomposition_estimate(self.measured_pct, dom, p_index)
+        tail_match = self.tail_probability_matching(hop_fits, p)
+
+        return {
+            "truth": truth, "dominant_hop": dom,
+            "naive_sum": naive, "fenton_wilkinson": fw,
+            "decomposition": decomp, "tail_probability_matching": tail_match,
+        }
+
+    def report(self, p=0.99):
+        print(f"{'hop':8s} {'mu':>7s} {'sigma':>7s} {'R2':>6s}")
+        for name, pct in self.measured_pct.items():
+            mu, sigma, r2 = fit_lognormal(pct)
+            print(f"{name:8s} {mu:7.4f} {sigma:7.4f} {r2:6.4f}")
+
+        dom_frac = self.single_big_jump(p)
+        print(f"\nSingle-big-jump dominance at p{int(p*100)} tail events:")
+        for n, frac in sorted(dom_frac.items(), key=lambda kv: -kv[1]):
+            print(f"  {n:8s}: {frac*100:5.1f}%")
+
+        res = self.compare_estimators(p)
+        print(f"\n{'estimator':28s} {'value':>10s} {'ratio to truth':>15s}")
+        for label, key in [
+            ("TRUE (ground truth)", "truth"),
+            ("naive sum", "naive_sum"),
+            ("Fenton-Wilkinson", "fenton_wilkinson"),
+            ("tail-probability matching", "tail_probability_matching"),
+            (f"median(others)+{res['dominant_hop']}'s own p{int(p*100)}", "decomposition"),
+        ]:
+            val = res[key]
+            ratio = "1.00" if key == "truth" else f"{val / res['truth']:.2f}"
+            print(f"{label:28s} {val:10.2f} {ratio:>15s}")
+
+
 if __name__ == "__main__":
     # Example wiring -- replace with real per-hop p50/p75/p90/p99 (ms).
     hop_percentiles = {
@@ -112,3 +206,17 @@ if __name__ == "__main__":
     print(f"naive sum p99:            {naive:7.2f}")
     print(f"Fenton-Wilkinson p99:     {fw_p99:7.2f}")
     print(f"decomposition estimate:  {decomp_p99:7.2f}")
+
+    # --- Stress test: do the estimators above hold up against KNOWN
+    # ground truth when the real distribution isn't pure lognormal? ---
+    print("\n" + "=" * 60)
+    print("SyntheticStressTest (mixture ground truth, same hop shapes)")
+    print("=" * 60)
+    hop_specs = {
+        "gateway": (0.010, (1.55, 0.35), (3.60, 0.40)),
+        "auth":    (0.015, (2.00, 0.35), (3.95, 0.40)),
+        "db":      (0.030, (2.80, 0.45), (4.85, 0.50)),  # cache misses -> fattest tail
+        "cache":   (0.005, (0.65, 0.25), (2.55, 0.30)),
+        "render":  (0.010, (2.20, 0.40), (4.25, 0.40)),
+    }
+    SyntheticStressTest(hop_specs).report(p=0.99)
